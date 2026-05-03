@@ -768,6 +768,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         extra += await configureChannel("telegram", {
           enabled: true,
           botToken: payload.telegramToken.trim(),
+          streaming: { mode: "partial" },
         });
       }
 
