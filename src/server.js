@@ -241,8 +241,11 @@ function describeDeviceApprovalForbidden(result) {
   }
 }
 
-const IMPORT_STAGING_ROOT = path.join(STATE_DIR, ".import-staging");
-const IMPORT_ROLLBACK_DIR = path.join(STATE_DIR, ".import-rollback");
+// Stage and rollback dirs MUST live outside STATE_DIR / WORKSPACE_DIR.
+// Otherwise the apply step tries to rename STATE_DIR into its own subdirectory (EINVAL).
+const WRAPPER_VOLUME_ROOT = path.dirname(STATE_DIR);
+const IMPORT_STAGING_ROOT = path.join(WRAPPER_VOLUME_ROOT, ".wrapper-import-staging");
+const IMPORT_ROLLBACK_DIR = path.join(WRAPPER_VOLUME_ROOT, ".wrapper-import-rollback");
 const IMPORT_STAGE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 function importStagingPath(stagingId) {
@@ -252,6 +255,16 @@ function importStagingPath(stagingId) {
 }
 
 function cleanupStaleImportStages() {
+  // Best-effort: remove leftover staging dirs from older builds that put them inside STATE_DIR
+  // (those caused EINVAL on rename and never got cleaned up).
+  for (const legacyName of [".import-staging", ".import-rollback"]) {
+    try {
+      const legacyPath = path.join(STATE_DIR, legacyName);
+      if (fs.existsSync(legacyPath)) {
+        fs.rmSync(legacyPath, { recursive: true, force: true });
+      }
+    } catch { /* ignore */ }
+  }
   try {
     if (!fs.existsSync(IMPORT_STAGING_ROOT)) return;
     const now = Date.now();
@@ -371,8 +384,10 @@ function applyDeploymentFixesToStaged(stagedStateDir) {
     "tui",                    // stale TUI session state
     "tasks",                  // stale runtime task state
     "wrapper.log",            // logs from the source wrapper
-    ".import-staging",        // any staging dir from the source (paranoia)
-    ".import-rollback",
+    ".import-staging",        // legacy: old wrapper builds put staging inside STATE_DIR
+    ".import-rollback",       // legacy: same as above
+    ".wrapper-import-staging",
+    ".wrapper-import-rollback",
   ];
   for (const rel of dropPaths) {
     const full = path.join(stagedStateDir, rel);

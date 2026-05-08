@@ -9,6 +9,7 @@ CLAUDE.md
 oc_main
 todos.md
 data/
+data.zip
 
 # Build artifacts
 /dist
