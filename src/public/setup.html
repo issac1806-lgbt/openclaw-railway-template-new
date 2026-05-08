@@ -93,9 +93,58 @@
         loginCode: '',
         setupStreamTail: '',
         setupError: '',
+        customBaseUrl: '',
+        customModelId: '',
+        customCompatibility: 'openai',
+        cloudflareAccountId: '',
+        cloudflareGatewayId: '',
 
-        get isOauthChoice() {
-          return this.selectedAuth === 'openai-codex-device-code';
+        get authRequiresSecret() {
+          const noSecretChoices = new Set([
+            'openai-codex-device-code',
+            'google-gemini-cli',
+            'github-copilot',
+            'copilot-proxy',
+            'minimax-global-oauth',
+            'minimax-cn-oauth',
+            'chutes',
+            'ollama',
+            'vllm',
+            'sglang',
+          ]);
+          return !noSecretChoices.has(this.selectedAuth);
+        },
+
+        get isCustomEndpointChoice() {
+          return this.selectedAuth === 'custom-api-key';
+        },
+
+        get isCloudflareGatewayChoice() {
+          return this.selectedAuth === 'cloudflare-ai-gateway-api-key';
+        },
+
+        get authHelp() {
+          switch (this.selectedAuth) {
+            case 'openai-codex-device-code':
+              return 'No API key needed. After clicking Run Setup, a ChatGPT login URL and code will appear below.';
+            case 'google-gemini-cli':
+              return 'OAuth via Google. The CLI will print a sign-in URL during onboarding.';
+            case 'github-copilot':
+              return 'GitHub device login. Open the URL printed during onboarding and approve the device code.';
+            case 'copilot-proxy':
+              return 'Uses a local Copilot proxy. No remote API key needed.';
+            case 'minimax-global-oauth':
+            case 'minimax-cn-oauth':
+              return 'OAuth via MiniMax. Sign-in URL will appear during onboarding.';
+            case 'chutes':
+              return 'Free-tier OAuth flow. Sign in via the URL printed during onboarding.';
+            case 'ollama':
+            case 'vllm':
+            case 'sglang':
+              return 'Self-hosted runtime. Make sure the server is reachable from this container.';
+            default:
+              return '';
+          }
         },
 
         get currentGroup() {
@@ -165,6 +214,11 @@
             authChoice: this.selectedAuth,
             authSecret: this.authSecret,
             model: this.model,
+            customBaseUrl: this.customBaseUrl,
+            customModelId: this.customModelId,
+            customCompatibility: this.customCompatibility,
+            cloudflareAccountId: this.cloudflareAccountId,
+            cloudflareGatewayId: this.cloudflareGatewayId,
             telegramToken: this.telegramToken,
             discordToken: this.discordToken,
             slackBotToken: this.slackBotToken,
@@ -591,16 +645,56 @@
                       </template>
                     </select>
                   </div>
-                  <div x-show="!isOauthChoice">
+                  <div x-show="authRequiresSecret">
                     <label
                       class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">API
                       Key / Token</label>
                     <input x-model="authSecret" type="password" placeholder="Paste your API key or token"
                       class="input-field" />
                   </div>
-                  <div x-show="isOauthChoice"
-                    class="bg-[var(--color-surface)] border border-[var(--color-border-muted)] rounded-lg p-3 text-xs text-[var(--color-text-secondary)] leading-relaxed">
-                    <strong class="text-[var(--color-text-primary)]">No API key needed.</strong> When you click Run Setup, a ChatGPT login URL and code will appear below — open the URL, sign in, and enter the code.
+                  <div x-show="authHelp"
+                    class="bg-[var(--color-surface)] border border-[var(--color-border-muted)] rounded-lg p-3 text-xs text-[var(--color-text-secondary)] leading-relaxed"
+                    x-text="authHelp"></div>
+                  <div x-show="isCustomEndpointChoice" class="space-y-3">
+                    <div>
+                      <label
+                        class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Custom
+                        base URL</label>
+                      <input x-model="customBaseUrl" type="text" placeholder="https://your-host.example.com/v1"
+                        class="input-field" />
+                    </div>
+                    <div>
+                      <label
+                        class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Custom
+                        model ID</label>
+                      <input x-model="customModelId" type="text" placeholder="e.g. my-model-id"
+                        class="input-field" />
+                    </div>
+                    <div>
+                      <label
+                        class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">API
+                        compatibility</label>
+                      <select x-model="customCompatibility" class="input-field">
+                        <option value="openai">OpenAI-compatible</option>
+                        <option value="anthropic">Anthropic-compatible</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div x-show="isCloudflareGatewayChoice" class="space-y-3">
+                    <div>
+                      <label
+                        class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">Cloudflare
+                        account ID</label>
+                      <input x-model="cloudflareAccountId" type="text" placeholder="Your Cloudflare account ID"
+                        class="input-field" />
+                    </div>
+                    <div>
+                      <label
+                        class="block text-xs uppercase tracking-wide text-[var(--color-text-muted)] font-medium mb-2">AI
+                        Gateway ID</label>
+                      <input x-model="cloudflareGatewayId" type="text" placeholder="The AI Gateway slug"
+                        class="input-field" />
+                    </div>
                   </div>
                   <div>
                     <label
@@ -853,6 +947,13 @@
                       </svg>
                       Pair Devices
                     </button>
+                    <a href="/logs" target="_blank" class="btn btn-secondary w-full">
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 6h16M4 12h16M4 18h7" />
+                      </svg>
+                      View Logs
+                    </a>
                   </section>
 
                   <!-- Danger Zone -->

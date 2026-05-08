@@ -90,6 +90,71 @@ function clawArgs(args) {
   return [OPENCLAW_ENTRY, ...args];
 }
 
+const LOG_RING_LIMIT = 500;
+const LOG_FILE_MAX_BYTES = 5 * 1024 * 1024;
+const logRing = [];
+const logSubscribers = new Set();
+const wrapperLogPath = path.join(STATE_DIR, "wrapper.log");
+
+function trimWrapperLogIfLarge() {
+  try {
+    const stat = fs.statSync(wrapperLogPath);
+    if (stat.size <= LOG_FILE_MAX_BYTES) return;
+    const fd = fs.openSync(wrapperLogPath, "r");
+    const keepBytes = Math.floor(LOG_FILE_MAX_BYTES / 2);
+    const buf = Buffer.alloc(keepBytes);
+    fs.readSync(fd, buf, 0, keepBytes, stat.size - keepBytes);
+    fs.closeSync(fd);
+    fs.writeFileSync(wrapperLogPath, buf);
+  } catch {
+    // best-effort; don't disrupt normal operation
+  }
+}
+
+function appendLog(level, source, message) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    source,
+    message: String(message),
+  };
+  logRing.push(entry);
+  while (logRing.length > LOG_RING_LIMIT) logRing.shift();
+
+  const line = `${entry.ts} [${level.toUpperCase()}] [${source}] ${entry.message}\n`;
+  const consoleFn =
+    level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+  consoleFn(line.trimEnd());
+
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.appendFileSync(wrapperLogPath, line);
+    trimWrapperLogIfLarge();
+  } catch {
+    // best-effort file write
+  }
+
+  for (const subscriber of logSubscribers) {
+    try {
+      subscriber.write(`data: ${JSON.stringify(entry)}\n\n`);
+    } catch {
+      logSubscribers.delete(subscriber);
+    }
+  }
+}
+
+const serverLog = {
+  info: (source, message) => appendLog("info", source, message),
+  warn: (source, message) => appendLog("warn", source, message),
+  error: (source, message) => appendLog("error", source, message),
+  recent: (limit = LOG_RING_LIMIT) =>
+    logRing.slice(Math.max(0, logRing.length - limit)),
+  subscribe: (res) => {
+    logSubscribers.add(res);
+    return () => logSubscribers.delete(res);
+  },
+};
+
 function stripAnsi(value) {
   return String(value)
     .replace(/\x1b\]8;;.*?\x1b\\|\x1b\]8;;\x1b\\/g, "")
@@ -216,6 +281,18 @@ async function syncAllowedOrigins() {
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
+let intentionallyRestarting = false;
+let consecutiveRestartCount = 0;
+let lastGatewayStartedAt = 0;
+
+const RESTART_BASE_DELAY_MS = 2_000;
+const RESTART_MAX_DELAY_MS = 60_000;
+const RESTART_RESET_AFTER_UPTIME_MS = 60_000;
+
+function nextRestartDelay() {
+  const exp = Math.min(consecutiveRestartCount, 5);
+  return Math.min(RESTART_BASE_DELAY_MS * 2 ** exp, RESTART_MAX_DELAY_MS);
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -303,25 +380,69 @@ async function startGateway() {
   console.log(`[gateway] WORKSPACE_DIR: ${WORKSPACE_DIR}`);
   console.log(`[gateway] config path: ${configPath()}`);
 
+  lastGatewayStartedAt = Date.now();
+
   gatewayProc.on("error", (err) => {
-    console.error(`[gateway] spawn error: ${String(err)}`);
+    serverLog.error("gateway", `spawn error: ${String(err)}`);
     gatewayProc = null;
   });
 
   gatewayProc.on("exit", (code, signal) => {
-    console.error(`[gateway] exited code=${code} signal=${signal}`);
+    const uptimeMs = Date.now() - lastGatewayStartedAt;
+    serverLog.warn(
+      "gateway",
+      `exited code=${code} signal=${signal} uptime=${Math.round(uptimeMs / 1000)}s`,
+    );
     gatewayProc = null;
-    if (!shuttingDown && isConfigured()) {
-      console.log("[gateway] scheduling auto-restart in 2s...");
-      setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
-          ensureGatewayRunning().catch((err) => {
-            console.error(`[gateway] auto-restart failed: ${err.message}`);
-          });
-        }
-      }, 2000);
+
+    if (intentionallyRestarting) {
+      intentionallyRestarting = false;
+      consecutiveRestartCount = 0;
+      return;
     }
+
+    if (shuttingDown || !isConfigured()) return;
+
+    if (uptimeMs >= RESTART_RESET_AFTER_UPTIME_MS) {
+      consecutiveRestartCount = 0;
+    }
+    consecutiveRestartCount += 1;
+    const delayMs = nextRestartDelay();
+    serverLog.info(
+      "gateway",
+      `auto-restart attempt ${consecutiveRestartCount} in ${delayMs}ms`,
+    );
+    setTimeout(async () => {
+      if (shuttingDown || gatewayProc || !isConfigured()) return;
+      // OpenClaw may have respawned itself in the meantime — probe first to avoid a redundant restart.
+      const alreadyUp = await probeAnyGatewayEndpoint();
+      if (alreadyUp) {
+        serverLog.info("gateway", "external restart detected, skipping respawn");
+        consecutiveRestartCount = 0;
+        return;
+      }
+      ensureGatewayRunning().catch((err) => {
+        serverLog.error("gateway", `auto-restart failed: ${err.message}`);
+      });
+    }, delayMs);
   });
+}
+
+async function probeAnyGatewayEndpoint() {
+  const endpoints = ["/openclaw", "/", "/health"];
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}` },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.status < 500) return true;
+    } catch {
+      // try next endpoint
+    }
+  }
+  return false;
 }
 
 async function ensureGatewayRunning() {
@@ -353,14 +474,16 @@ function isGatewayReady() {
 
 async function restartGateway() {
   if (gatewayProc) {
+    intentionallyRestarting = true;
     try {
       gatewayProc.kill("SIGTERM");
     } catch (err) {
-      console.warn(`[gateway] kill error: ${err.message}`);
+      serverLog.warn("gateway", `kill error: ${err.message}`);
     }
     await sleep(750);
     gatewayProc = null;
   }
+  consecutiveRestartCount = 0;
   return ensureGatewayRunning();
 }
 
@@ -465,6 +588,10 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
   res.sendFile(path.join(process.cwd(), "src", "public", "setup.html"));
 });
 
+app.get("/logs", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "logs.html"));
+});
+
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   const { version, channelsHelp } = await getOpenclawInfo();
 
@@ -493,10 +620,41 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     {
       value: "google",
       label: "Google",
-      hint: "API key",
+      hint: "API key / OAuth",
       options: [
         { value: "gemini-api-key", label: "Google Gemini API key" },
+        { value: "google-gemini-cli", label: "Gemini CLI (OAuth)" },
       ],
+    },
+    {
+      value: "deepseek",
+      label: "DeepSeek",
+      hint: "API key",
+      options: [{ value: "deepseek-api-key", label: "DeepSeek API key" }],
+    },
+    {
+      value: "xai",
+      label: "xAI (Grok)",
+      hint: "API key",
+      options: [{ value: "xai-api-key", label: "xAI API key" }],
+    },
+    {
+      value: "mistral",
+      label: "Mistral AI",
+      hint: "API key",
+      options: [{ value: "mistral-api-key", label: "Mistral API key" }],
+    },
+    {
+      value: "together",
+      label: "Together AI",
+      hint: "API key",
+      options: [{ value: "together-api-key", label: "Together AI API key" }],
+    },
+    {
+      value: "huggingface",
+      label: "Hugging Face",
+      hint: "API key",
+      options: [{ value: "huggingface-api-key", label: "Hugging Face API key" }],
     },
     {
       value: "openrouter",
@@ -513,27 +671,53 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       ],
     },
     {
+      value: "cloudflare-ai-gateway",
+      label: "Cloudflare AI Gateway",
+      hint: "API key + account/gateway IDs",
+      options: [
+        {
+          value: "cloudflare-ai-gateway-api-key",
+          label: "Cloudflare AI Gateway API key",
+        },
+      ],
+    },
+    {
+      value: "litellm",
+      label: "LiteLLM",
+      hint: "Proxy / multi-model router",
+      options: [{ value: "litellm-api-key", label: "LiteLLM API key" }],
+    },
+    {
       value: "moonshot",
       label: "Moonshot AI",
       hint: "Kimi K2 + Kimi Code",
       options: [
-        { value: "moonshot-api-key", label: "Moonshot AI API key" },
+        { value: "moonshot-api-key", label: "Moonshot AI API key (Global)" },
+        { value: "moonshot-api-key-cn", label: "Moonshot AI API key (CN)" },
         { value: "kimi-code-api-key", label: "Kimi Code API key" },
       ],
     },
     {
       value: "zai",
       label: "Z.AI (GLM 4.7)",
-      hint: "API key",
-      options: [{ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" }],
+      hint: "API key (multiple plans)",
+      options: [
+        { value: "zai-api-key", label: "Z.AI API key" },
+        { value: "zai-coding-global", label: "Z.AI Coding (Global)" },
+        { value: "zai-coding-cn", label: "Z.AI Coding (CN)" },
+        { value: "zai-global", label: "Z.AI Standard (Global)" },
+        { value: "zai-cn", label: "Z.AI Standard (CN)" },
+      ],
     },
     {
       value: "minimax",
       label: "MiniMax",
-      hint: "M2.7 (recommended)",
+      hint: "M2.7 (recommended) — API key or OAuth",
       options: [
         { value: "minimax-global-api", label: "MiniMax API key (Global)" },
+        { value: "minimax-global-oauth", label: "MiniMax OAuth (Global)" },
         { value: "minimax-cn-api", label: "MiniMax API key (CN)" },
+        { value: "minimax-cn-oauth", label: "MiniMax OAuth (CN)" },
       ],
     },
     {
@@ -544,6 +728,49 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
         { value: "qwen-api-key", label: "Qwen API key (Global)" },
         { value: "qwen-api-key-cn", label: "Qwen API key (CN)" },
       ],
+    },
+    {
+      value: "alibaba",
+      label: "Alibaba Model Studio",
+      hint: "DashScope / Model Studio",
+      options: [
+        {
+          value: "alibaba-model-studio-api-key",
+          label: "Alibaba Model Studio API key",
+        },
+      ],
+    },
+    {
+      value: "regional-cn",
+      label: "Other Chinese providers",
+      hint: "Xiaomi / Volcengine / BytePlus / Qianfan",
+      options: [
+        { value: "xiaomi-api-key", label: "Xiaomi API key" },
+        { value: "volcengine-api-key", label: "Volcengine API key" },
+        { value: "byteplus-api-key", label: "BytePlus API key" },
+        { value: "qianfan-api-key", label: "Baidu Qianfan API key" },
+      ],
+    },
+    {
+      value: "venice",
+      label: "Venice",
+      hint: "API key",
+      options: [{ value: "venice-api-key", label: "Venice API key" }],
+    },
+    {
+      value: "chutes",
+      label: "Chutes",
+      hint: "Free tier or API key",
+      options: [
+        { value: "chutes", label: "Chutes (free tier OAuth)" },
+        { value: "chutes-api-key", label: "Chutes API key" },
+      ],
+    },
+    {
+      value: "kilocode",
+      label: "Kilocode",
+      hint: "API key",
+      options: [{ value: "kilocode-api-key", label: "Kilocode API key" }],
     },
     {
       value: "copilot",
@@ -564,11 +791,30 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       options: [{ value: "synthetic-api-key", label: "Synthetic API key" }],
     },
     {
-      value: "opencode-zen",
-      label: "OpenCode Zen",
-      hint: "API key",
+      value: "opencode",
+      label: "OpenCode",
+      hint: "Multi-model proxies",
       options: [
-        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+        { value: "opencode-zen", label: "OpenCode Zen" },
+        { value: "opencode-go", label: "OpenCode Go" },
+      ],
+    },
+    {
+      value: "self-hosted",
+      label: "Self-hosted",
+      hint: "Ollama / vLLM / SGLang — no API key needed",
+      options: [
+        { value: "ollama", label: "Ollama" },
+        { value: "vllm", label: "vLLM" },
+        { value: "sglang", label: "SGLang" },
+      ],
+    },
+    {
+      value: "custom",
+      label: "Custom provider",
+      hint: "OpenAI- or Anthropic-compatible endpoint",
+      options: [
+        { value: "custom-api-key", label: "Custom endpoint (base URL + model ID)" },
       ],
     },
   ];
@@ -625,24 +871,65 @@ function buildOnboardArgs(payload) {
     const map = {
       "openai-api-key": "--openai-api-key",
       apiKey: "--anthropic-api-key",
+      "gemini-api-key": "--gemini-api-key",
+      "deepseek-api-key": "--deepseek-api-key",
+      "xai-api-key": "--xai-api-key",
+      "mistral-api-key": "--mistral-api-key",
+      "together-api-key": "--together-api-key",
+      "huggingface-api-key": "--huggingface-api-key",
       "openrouter-api-key": "--openrouter-api-key",
       "ai-gateway-api-key": "--ai-gateway-api-key",
+      "cloudflare-ai-gateway-api-key": "--cloudflare-ai-gateway-api-key",
+      "litellm-api-key": "--litellm-api-key",
       "moonshot-api-key": "--moonshot-api-key",
+      "moonshot-api-key-cn": "--moonshot-api-key",
       "kimi-code-api-key": "--kimi-code-api-key",
-      "gemini-api-key": "--gemini-api-key",
       "zai-api-key": "--zai-api-key",
+      "zai-coding-global": "--zai-api-key",
+      "zai-coding-cn": "--zai-api-key",
+      "zai-global": "--zai-api-key",
+      "zai-cn": "--zai-api-key",
       "minimax-global-api": "--minimax-api-key",
       "minimax-cn-api": "--minimax-api-key",
       "qwen-api-key": "--qwen-api-key",
       "qwen-api-key-cn": "--qwen-api-key",
+      "alibaba-model-studio-api-key": "--alibaba-model-studio-api-key",
+      "xiaomi-api-key": "--xiaomi-api-key",
+      "volcengine-api-key": "--volcengine-api-key",
+      "byteplus-api-key": "--byteplus-api-key",
+      "qianfan-api-key": "--qianfan-api-key",
+      "venice-api-key": "--venice-api-key",
+      "chutes-api-key": "--chutes-api-key",
+      "kilocode-api-key": "--kilocode-api-key",
       "synthetic-api-key": "--synthetic-api-key",
       "opencode-zen": "--opencode-zen-api-key",
+      "opencode-go": "--opencode-go-api-key",
+      "custom-api-key": "--custom-api-key",
     };
     const flag = map[payload.authChoice];
     if (flag && secret) {
       args.push(flag, secret);
     }
 
+    if (payload.authChoice === "custom-api-key") {
+      const baseUrl = (payload.customBaseUrl || "").trim();
+      const modelId = (payload.customModelId || "").trim();
+      const compat = (payload.customCompatibility || "").trim();
+      if (baseUrl) args.push("--custom-base-url", baseUrl);
+      if (modelId) args.push("--custom-model-id", modelId);
+      if (compat) args.push("--custom-compatibility", compat);
+    }
+
+    if (payload.authChoice === "cloudflare-ai-gateway-api-key") {
+      const accountId = (payload.cloudflareAccountId || "").trim();
+      const gatewayId = (payload.cloudflareGatewayId || "").trim();
+      if (accountId) {
+        args.push("--cloudflare-ai-gateway-account-id", accountId);
+      }
+      if (gatewayId) {
+        args.push("--cloudflare-ai-gateway-gateway-id", gatewayId);
+      }
+    }
   }
 
   return args;
@@ -738,19 +1025,48 @@ const VALID_AUTH_CHOICES = [
   "openai-codex-device-code",
   "apiKey",
   "gemini-api-key",
+  "google-gemini-cli",
+  "deepseek-api-key",
+  "xai-api-key",
+  "mistral-api-key",
+  "together-api-key",
+  "huggingface-api-key",
   "openrouter-api-key",
   "ai-gateway-api-key",
+  "cloudflare-ai-gateway-api-key",
+  "litellm-api-key",
   "moonshot-api-key",
+  "moonshot-api-key-cn",
   "kimi-code-api-key",
   "zai-api-key",
+  "zai-coding-global",
+  "zai-coding-cn",
+  "zai-global",
+  "zai-cn",
   "minimax-global-api",
+  "minimax-global-oauth",
   "minimax-cn-api",
+  "minimax-cn-oauth",
   "qwen-api-key",
   "qwen-api-key-cn",
+  "alibaba-model-studio-api-key",
+  "xiaomi-api-key",
+  "volcengine-api-key",
+  "byteplus-api-key",
+  "qianfan-api-key",
+  "venice-api-key",
+  "chutes",
+  "chutes-api-key",
+  "kilocode-api-key",
   "github-copilot",
   "copilot-proxy",
   "synthetic-api-key",
   "opencode-zen",
+  "opencode-go",
+  "ollama",
+  "vllm",
+  "sglang",
+  "custom-api-key",
 ];
 
 function validatePayload(payload) {
@@ -767,6 +1083,11 @@ function validatePayload(payload) {
     "slackAppToken",
     "authSecret",
     "model",
+    "customBaseUrl",
+    "customModelId",
+    "customCompatibility",
+    "cloudflareAccountId",
+    "cloudflareGatewayId",
   ];
   for (const field of stringFields) {
     if (payload[field] !== undefined && typeof payload[field] !== "string") {
@@ -1104,6 +1425,40 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
     .json({ ok: result.code === 0, output: result.output });
 });
 
+app.get("/setup/api/logs", requireSetupAuth, (req, res) => {
+  const limitParam = Number.parseInt(req.query?.limit ?? "", 10);
+  const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 200;
+  res.json({ ok: true, entries: serverLog.recent(limit) });
+});
+
+app.get("/setup/api/logs/stream", requireSetupAuth, (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+
+  for (const entry of serverLog.recent(100)) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(": ping\n\n");
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 25000);
+
+  const unsubscribe = serverLog.subscribe(res);
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+});
+
 app.get("/setup/api/export", requireSetupAuth, async (_req, res) => {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const zipName = `openclaw-export-${timestamp}.zip`;
@@ -1365,24 +1720,24 @@ app.use(async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[wrapper] listening on port ${PORT}`);
-  console.log(`[wrapper] setup wizard: http://localhost:${PORT}/setup`);
-  console.log(`[wrapper] web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
-  console.log(`[wrapper] configured: ${isConfigured()}`);
+  serverLog.info("wrapper", `listening on port ${PORT}`);
+  serverLog.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
+  serverLog.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
+  serverLog.info("wrapper", `configured: ${isConfigured()}`);
 
   if (isConfigured()) {
     (async () => {
       try {
-        console.log("[wrapper] running openclaw doctor --fix...");
+        serverLog.info("wrapper", "running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
-        console.log(`[wrapper] doctor --fix exit=${dr.code}`);
-        if (dr.output) console.log(dr.output);
+        serverLog.info("wrapper", `doctor --fix exit=${dr.code}`);
+        if (dr.output) serverLog.info("wrapper", dr.output.trim());
       } catch (err) {
-        console.warn(`[wrapper] doctor --fix failed: ${err.message}`);
+        serverLog.warn("wrapper", `doctor --fix failed: ${err.message}`);
       }
       await ensureGatewayRunning();
     })().catch((err) => {
-      console.error(`[wrapper] failed to start gateway at boot: ${err.message}`);
+      serverLog.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     });
   }
 });
@@ -1432,7 +1787,7 @@ server.on("upgrade", async (req, socket, head) => {
 });
 
 async function gracefulShutdown(signal) {
-  console.log(`[wrapper] received ${signal}, shutting down`);
+  serverLog.info("wrapper", `received ${signal}, shutting down`);
   shuttingDown = true;
 
   if (setupRateLimiter.cleanupInterval) {
@@ -1460,8 +1815,18 @@ async function gracefulShutdown(signal) {
         gatewayProc.kill("SIGKILL");
       }
     } catch (err) {
-      console.warn(`[wrapper] error killing gateway: ${err.message}`);
+      serverLog.warn("wrapper", `error killing gateway: ${err.message}`);
     }
+  }
+
+  // Best-effort: ask the CLI to clean up any persisted gateway service state.
+  try {
+    await Promise.race([
+      runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"])),
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  } catch {
+    // best-effort; we're exiting anyway
   }
 
   process.exit(0);
