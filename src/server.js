@@ -416,8 +416,23 @@ function applyDeploymentFixesToStaged(stagedStateDir) {
   cfg.gateway.trustedProxies = ["127.0.0.1"];
   cfg.gateway.controlUi = cfg.gateway.controlUi || {};
   cfg.gateway.controlUi.allowInsecureAuth = true;
-  // Drop the imported allowedOrigins; syncAllowedOrigins() will repopulate at startup.
-  delete cfg.gateway.controlUi.allowedOrigins;
+  // Rewrite allowedOrigins to THIS deployment's public URL so the imported
+  // config points at the right host. Falls back to deletion if RAILWAY_PUBLIC_DOMAIN
+  // is missing (in which case syncAllowedOrigins runs at gateway start as a fallback).
+  const publicDomain = (process.env.RAILWAY_PUBLIC_DOMAIN || "").trim();
+  if (publicDomain) {
+    cfg.gateway.controlUi.allowedOrigins = [`https://${publicDomain}`];
+    serverLog.info(
+      "import",
+      `set allowedOrigins to [https://${publicDomain}] for imported config`,
+    );
+  } else {
+    delete cfg.gateway.controlUi.allowedOrigins;
+    serverLog.warn(
+      "import",
+      "RAILWAY_PUBLIC_DOMAIN not set — allowedOrigins removed; gateway may reject browser connects",
+    );
+  }
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 }
 
@@ -455,8 +470,14 @@ function isConfigured() {
 }
 
 async function syncAllowedOrigins() {
-  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
-  if (!publicDomain) return;
+  const publicDomain = (process.env.RAILWAY_PUBLIC_DOMAIN || "").trim();
+  if (!publicDomain) {
+    serverLog.warn(
+      "gateway",
+      "syncAllowedOrigins: RAILWAY_PUBLIC_DOMAIN not set — skipping (gateway will reject remote browser origins)",
+    );
+    return;
+  }
 
   const origin = `https://${publicDomain}`;
   const result = await runCmd(
@@ -470,9 +491,12 @@ async function syncAllowedOrigins() {
     ]),
   );
   if (result.code === 0) {
-    console.log("gateway", `set allowedOrigins to [${origin}]`);
+    serverLog.info("gateway", `allowedOrigins set to [${origin}]`);
   } else {
-    console.warn("gateway", `failed to set allowedOrigins (exit=${result.code})`);
+    serverLog.warn(
+      "gateway",
+      `failed to set allowedOrigins (exit=${result.code}): ${result.output?.slice(-300) || ""}`,
+    );
   }
 }
 
