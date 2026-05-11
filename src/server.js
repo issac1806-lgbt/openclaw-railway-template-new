@@ -1,3 +1,21 @@
+import fs from 'fs';
+import path from 'path';
+
+// Clean up corrupted auth state on startup
+const dataDir = process.env.OPENCLAW_STATE_DIR || '/data';
+const authFiles = ['auth-state.json', 'auth-profiles.json', 'openclaw.json'];
+
+for (const file of authFiles) {
+  const filePath = path.join(dataDir, file);
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log(`Cleaned up ${file}`);
+    }
+  } catch (err) {
+    console.warn(`Could not delete ${file}:`, err.message);
+  }
+}
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
