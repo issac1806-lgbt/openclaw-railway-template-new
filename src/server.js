@@ -18,7 +18,6 @@ for (const file of authFiles) {
 }
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
-import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
