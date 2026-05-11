@@ -411,7 +411,7 @@ function applyDeploymentFixesToStaged(stagedStateDir) {
   cfg.gateway.auth = cfg.gateway.auth || {};
   cfg.gateway.auth.mode = "token";
   cfg.gateway.auth.token = OPENCLAW_GATEWAY_TOKEN;
-  cfg.gateway.bind = "loopback";
+  cfg.gateway.bind = "0.0.0.0";
   cfg.gateway.port = INTERNAL_GATEWAY_PORT;
   cfg.gateway.trustedProxies = ["127.0.0.1"];
   cfg.gateway.controlUi = cfg.gateway.controlUi || {};
@@ -573,7 +573,7 @@ async function startGateway() {
     "gateway",
     "run",
     "--bind",
-    "loopback",
+    "0.0.0.0",
     "--port",
     String(INTERNAL_GATEWAY_PORT),
     "--auth",
@@ -1062,7 +1062,7 @@ function buildOnboardArgs(payload) {
     "--workspace",
     WORKSPACE_DIR,
     "--gateway-bind",
-    "loopback",
+    "0.0.0.0",
     "--gateway-port",
     String(INTERNAL_GATEWAY_PORT),
     "--gateway-auth",
